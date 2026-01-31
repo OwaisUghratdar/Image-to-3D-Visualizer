@@ -31,10 +31,6 @@ In essence, the project enables a seamless workflow: **Upload an image -> See it
 To get this project running on your local machine, follow these steps:
 
 1.  **Clone the Repository:**
-    ```bash
-    git clone <YOUR_REPOSITORY_URL>
-    cd <YOUR_PROJECT_DIRECTORY>
-    ```
 
 2.  **Supabase Configuration:**
     *   **Create a Supabase Project:** If you don't have one, create a new project on [Supabase](https://supabase.com/).
