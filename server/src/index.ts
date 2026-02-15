@@ -1,79 +1,107 @@
-// Import necessary modules from the Express framework and standard Node.js libraries.
 import express, { Express, Request, Response } from 'express';
 import multer, { Multer } from 'multer';
-import path from 'path';
 import cors from 'cors';
-import fs from 'fs';
 import { supabase } from './supabaseClient';
 
-// --- Configuration ---
-
-// Define the port the server will run on. Use an environment variable or default to 3001.
 const PORT = process.env.PORT || 3001;
+const STORAGE_BUCKET = 'textures';
+const MAX_STORED_FILES = 10;
 
-// --- Express App Initialization ---
-
-// Create an instance of the Express application.
 const app: Express = express();
 
-// --- Middleware ---
-
-// Enable Cross-Origin Resource Sharing (CORS) for all routes.
-// This is crucial for allowing the React frontend (running on a different port)
-// to communicate with this backend.
 app.use(cors());
 
-// --- File Upload Handling (Multer) ---
-
-// Configure multer to use memory storage.
-// This is because we are going to upload the file to Supabase directly,
-// so we don't need to save it to the disk first.
 const storage = multer.memoryStorage();
 const upload: Multer = multer({ storage });
 
-// --- API Routes ---
+function getStoragePathFromPublicUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const marker = `/object/public/${STORAGE_BUCKET}/`;
+    const markerIndex = parsed.pathname.indexOf(marker);
 
-/**
- * @route   GET /files
- * @desc    Get a list of all uploaded files from Supabase.
- * @access  Public
- */
-app.get('/files', async (req: Request, res: Response) => {
-  console.log('GET /files: Retrieving file list from Supabase.');
-  
-  // Assumes you have a table named 'files' with columns 'id', 'name', and 'url'.
-  const { data, error } = await supabase.from('files').select('*');
+    if (markerIndex === -1) {
+      return null;
+    }
+
+    const objectPath = parsed.pathname.slice(markerIndex + marker.length);
+    return objectPath ? decodeURIComponent(objectPath) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function enforceMaxStoredFiles() {
+  const { data: files, error } = await supabase
+    .from('textures')
+    .select('id,url,created_at')
+    .order('created_at', { ascending: true });
+
+  if (error || !files || files.length <= MAX_STORED_FILES) {
+    return;
+  }
+
+  const filesToRemove = files.slice(0, files.length - MAX_STORED_FILES);
+  const idsToRemove = filesToRemove.map((file) => file.id);
+  const storagePathsToRemove = filesToRemove
+    .map((file) => getStoragePathFromPublicUrl(file.url))
+    .filter((path): path is string => Boolean(path));
+
+  if (idsToRemove.length > 0) {
+    const { error: deleteRowsError } = await supabase
+      .from('textures')
+      .delete()
+      .in('id', idsToRemove);
+
+    if (deleteRowsError) {
+      console.error('Failed deleting old file rows:', deleteRowsError);
+    }
+  }
+
+  if (storagePathsToRemove.length > 0) {
+    const { error: deleteStorageError } = await supabase.storage
+      .from(STORAGE_BUCKET)
+      .remove(storagePathsToRemove);
+
+    if (deleteStorageError) {
+      console.error('Failed deleting old storage objects:', deleteStorageError);
+    }
+  }
+}
+
+app.get('/files', async (_req: Request, res: Response) => {
+  const { data, error } = await supabase
+    .from('textures')
+    .select('*')
+    .order('created_at', { ascending: false });
 
   if (error) {
     console.error('Error fetching files from Supabase:', error);
     return res.status(500).json({ error: error.message });
   }
 
-  res.json(data);
+  return res.json(data);
 });
 
-/**
- * @route   POST /upload
- * @desc    Upload a new image file to Supabase.
- * @access  Public
- */
 app.post('/upload', upload.single('image'), async (req: Request, res: Response) => {
   if (!req.file) {
-    console.error('POST /upload: No file provided.');
-    return res.status(400).send('No file uploaded.');
+    return res.status(400).json({ error: 'No file uploaded.' });
   }
 
   const file = req.file;
+
+  if (!file.mimetype.startsWith('image/')) {
+    return res.status(400).json({ error: 'Only image uploads are supported.' });
+  }
+
   const fileName = `${Date.now()}-${file.originalname}`;
 
-  console.log(`POST /upload: Received file "${file.originalname}". Uploading to Supabase as "${fileName}".`);
-
-  // Assumes you have a Supabase Storage bucket named 'textures'.
-  const { data: uploadData, error: uploadError } = await supabase.storage
-    .from('textures') // Changed from 'images' to 'textures'
+  const { error: uploadError } = await supabase.storage
+    .from(STORAGE_BUCKET)
     .upload(fileName, file.buffer, {
       contentType: file.mimetype,
       cacheControl: '3600',
+      upsert: false,
     });
 
   if (uploadError) {
@@ -81,143 +109,32 @@ app.post('/upload', upload.single('image'), async (req: Request, res: Response) 
     return res.status(500).json({ error: uploadError.message });
   }
 
-  // Get the public URL of the uploaded file
   const { data: publicUrlData } = supabase.storage
-    .from('textures') // Changed from 'images' to 'textures'
+    .from(STORAGE_BUCKET)
     .getPublicUrl(fileName);
 
-  if (!publicUrlData) {
-      return res.status(500).json({ error: 'Could not get public URL for the uploaded file.' });
+  const fileUrl = publicUrlData?.publicUrl;
+  if (!fileUrl) {
+    return res.status(500).json({ error: 'Could not get public URL for uploaded file.' });
   }
-  const fileUrl = publicUrlData.publicUrl;
 
-
-  // Save the file metadata to the 'files' table.
   const { data: dbData, error: dbError } = await supabase
-    .from('files')
+    .from('textures')
     .insert([{ name: file.originalname, url: fileUrl }])
-    .select();
+    .select()
+    .single();
 
   if (dbError) {
     console.error('Error saving file metadata to Supabase DB:', dbError);
+    await supabase.storage.from(STORAGE_BUCKET).remove([fileName]);
     return res.status(500).json({ error: dbError.message });
   }
 
-  res.status(201).json(dbData[0]);
+  await enforceMaxStoredFiles();
+
+  return res.status(201).json(dbData);
 });
 
-// --- Server Startup ---
-
-// Start the Express server and listen for incoming requests on the specified port.
 app.listen(PORT, () => {
-  console.log(`
-    ================================================
-    🚀 TypeScript Express server is running!
-    ✅ Listening on port: ${PORT}
-    🌐 Frontend should connect to this address.
-    ================================================
-  `);
-});
-
-// --- Middleware ---
-
-// Enable Cross-Origin Resource Sharing (CORS) for all routes.
-// This is crucial for allowing the React frontend (running on a different port)
-// to communicate with this backend.
-app.use(cors());
-
-// --- File Upload Handling (Multer) ---
-
-// Configure multer to use memory storage.
-// This is because we are going to upload the file to Supabase directly,
-// so we don't need to save it to the disk first.
-const storage = multer.memoryStorage();
-const upload: Multer = multer({ storage });
-
-// --- API Routes ---
-
-/**
- * @route   GET /files
- * @desc    Get a list of all uploaded files from Supabase.
- * @access  Public
- */
-app.get('/files', async (req: Request, res: Response) => {
-  console.log('GET /files: Retrieving file list from Supabase.');
-  
-  // Assumes you have a table named 'files' with columns 'id', 'name', and 'url'.
-  const { data, error } = await supabase.from('files').select('*');
-
-  if (error) {
-    console.error('Error fetching files from Supabase:', error);
-    return res.status(500).json({ error: error.message });
-  }
-
-  res.json(data);
-});
-
-/**
- * @route   POST /upload
- * @desc    Upload a new image file to Supabase.
- * @access  Public
- */
-app.post('/upload', upload.single('image'), async (req: Request, res: Response) => {
-  if (!req.file) {
-    console.error('POST /upload: No file provided.');
-    return res.status(400).send('No file uploaded.');
-  }
-
-  const file = req.file;
-  const fileName = `${Date.now()}-${file.originalname}`;
-
-  console.log(`POST /upload: Received file "${file.originalname}". Uploading to Supabase as "${fileName}".`);
-
-  // Assumes you have a Supabase Storage bucket named 'images'.
-  const { data: uploadData, error: uploadError } = await supabase.storage
-    .from('images')
-    .upload(fileName, file.buffer, {
-      contentType: file.mimetype,
-      cacheControl: '3600',
-    });
-
-  if (uploadError) {
-    console.error('Error uploading file to Supabase Storage:', uploadError);
-    return res.status(500).json({ error: uploadError.message });
-  }
-
-  // Get the public URL of the uploaded file
-  const { data: publicUrlData } = supabase.storage
-    .from('images')
-    .getPublicUrl(fileName);
-
-  if (!publicUrlData) {
-      return res.status(500).json({ error: 'Could not get public URL for the uploaded file.' });
-  }
-  const fileUrl = publicUrlData.publicUrl;
-
-
-  // Save the file metadata to the 'files' table.
-  const { data: dbData, error: dbError } = await supabase
-    .from('files')
-    .insert([{ name: file.originalname, url: fileUrl }])
-    .select();
-
-  if (dbError) {
-    console.error('Error saving file metadata to Supabase DB:', dbError);
-    return res.status(500).json({ error: dbError.message });
-  }
-
-  res.status(201).json(dbData[0]);
-});
-
-// --- Server Startup ---
-
-// Start the Express server and listen for incoming requests on the specified port.
-app.listen(PORT, () => {
-  console.log(`
-    ================================================
-    🚀 TypeScript Express server is running!
-    ✅ Listening on port: ${PORT}
-    🌐 Frontend should connect to this address.
-    ================================================
-  `);
+  console.log(`Server listening on http://localhost:${PORT}`);
 });
